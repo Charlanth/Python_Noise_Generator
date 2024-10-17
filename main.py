@@ -10,7 +10,6 @@
 
 import pygame, sys, random
 from pygame.locals import QUIT
-from os import path
 
 def initialize_graphics() -> pygame.Surface:
     """
