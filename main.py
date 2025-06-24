@@ -1,14 +1,15 @@
 # Noise Generator
 # Name: Charles-Émile Lanthier
-# Version: alpha 0.0.0
-# Last revision: 2024-10-17
+# Version: alpha 0.1.0
+# Last revision: 2025-06-21
 
 # TODO: Add mountain range map
-# !FIX: Fix chunk border artifacts
 # TODO: Add biomes (maybe)
 # TODO: Add interface to customize generation parameters (maybe)
 
 import pygame, sys, random
+import numpy as np
+import time
 from pygame.locals import QUIT
 
 def initialize_graphics() -> pygame.Surface:
@@ -172,6 +173,8 @@ class World:
         self.chunks = {}
         self.continent_map = {}
         self.mountain_map = {} 
+        self.noise_array = None
+        self.tiles_by_position = {}
 
 # Constants
 world = World()
@@ -183,61 +186,106 @@ world_size = 256
 chunk_size = 32 * tile_size # The size of a chunk side in pixels, by default 32 tiles or 64 pixels
 world_size_px = world_size * tile_size # The size of the world sides in pixels
 
-def compare_tile_neighbors(tile : Tile, neighbor_tile_dist=1) -> tuple:
+def create_noise_array() -> np.ndarray:
     """
-    Compares the noise value of a tile with its neighboring tiles and returns the count of matching neighbors.
-
-    This function checks the adjacent tiles (up, down, left, right) around a given tile within the same chunk and 
-    neighboring chunks, if necessary. It compares the noise value of each neighboring tile to the current tile's 
-    noise value. 
-
-    Args:
-        tile (Tile): The tile whose neighbors will be compared. The tile must have 'x', 'y', and 'noise_val' attributes.
-        neighbor_tile_dist (int, optional): The distance between the tile and its neighbors. 
-        Defaults to 1, which means directly adjacent tiles.
-
-    Returns:
-        tuple: A tuple containing:
-        - neighbor_ammount (int): The number of neighboring tiles with the same noise value as the given tile.
-        - combined_noise_value (int): The noise value of the surounding land.
-        - average_noise_value (int): The average noise value of the surounding noise.
+    Creates a numpy array representation of the world's noise values for faster processing.
     """
-    
-    neighbors = [(0, -1), (-1, 0), (0, 1), (1, 0)] # Directions for neighbor Tiles (Up, Left, Down, Right)
-    current_chunk_x = tile.x - (tile.x % chunk_size)
-    current_chunk_y = tile.y - (tile.y % chunk_size)
-    current_chunk = world.chunks.get((current_chunk_x, current_chunk_y))
+    tiles_per_side = world_size_px // tile_size
+    noise_array = np.zeros((tiles_per_side, tiles_per_side), dtype=np.int8)
 
-    neighbor_ammount = 0
-    combined_noise_value = 0
-    average_noise_value = 0
-    for neighbor_x, neighbor_y in neighbors:
-        neighbor_tile_x = tile.x + neighbor_x * tile_size * neighbor_tile_dist
-        neighbor_tile_y = tile.y + neighbor_y * tile_size * neighbor_tile_dist
+    for chunk_coords, chunk in world.chunks.items():
+        for (tile_x, tile_y), tile in chunk.tiles.items():
+            array_x = tile_x // tile_size
+            array_y = tile_y // tile_size
+            noise_array[array_y, array_x] = tile.noise_val
 
-        # Check if the neighbor tile is in the current chunk
-        if (neighbor_tile_x // chunk_size == current_chunk_x // chunk_size and
-            neighbor_tile_y // chunk_size == current_chunk_y // chunk_size):
-            neighbor_tile = current_chunk.tiles.get((neighbor_tile_x, neighbor_tile_y))
-        else:
-            # Fetch the neighboring chunk only if the neighbor is in a different chunk
-            neighbor_chunk_x = neighbor_tile_x - (neighbor_tile_x % chunk_size)
-            neighbor_chunk_y = neighbor_tile_y - (neighbor_tile_y % chunk_size)
-            neighbor_chunk = world.chunks.get((neighbor_chunk_x, neighbor_chunk_y))
-            if neighbor_chunk:
-                neighbor_tile = neighbor_chunk.tiles.get((neighbor_tile_x, neighbor_tile_y))
-            else: # Ignores world border adds a neighbor to the count
-                neighbor_tile = None
-                neighbor_ammount += 1
-                combined_noise_value += 1
+    return noise_array
 
-        if neighbor_tile:
-            combined_noise_value += neighbor_tile.noise_val
-            if neighbor_tile.noise_val == tile.noise_val:
-                neighbor_ammount += 1 
-    if neighbor_ammount > 0:
-        average_noise_value = combined_noise_value // neighbor_ammount
-    return neighbor_ammount, combined_noise_value, average_noise_value
+def update_tiles_from_array(noise_array: np.ndarray) -> None:
+    """
+    Updates tile noise values from the numpy array.
+    """
+    for chunk_coords, chunk in world.chunks.items():
+        for (tile_x, tile_y), tile in chunk.tiles.items():
+            array_x = tile_x // tile_size
+            array_y = tile_y // tile_size
+            tile.noise_val = noise_array[array_y, array_x]
+
+def smoothen_noise_vectorized(repetition: int) -> None:
+    """
+    Ultra-fast vectorized noise smoothing using numpy operations.
+    This is orders of magnitude faster than the tile-by-tile approach.
+    """
+    if world.noise_array is None:
+        world.noise_array = create_noise_array()
+
+    noise = world.noise_array.astype(np.float32)
+
+    for _ in range(repetition):
+        # Create shifted versions for neighbor calculation
+        # Pad array to handle boundaries (assume water at edges)
+        padded = np.pad(noise, 1, mode='constant', constant_values=0)
+
+        # Calculate neighbor sums using vectorized operations
+        neighbor_sum = (
+            padded[:-2, 1:-1] +  # up
+            padded[2:, 1:-1] +   # down  
+            padded[1:-1, :-2] +  # left
+            padded[1:-1, 2:]     # right
+        )
+
+        # Apply smoothing rules vectorized
+        # Land if 3+ neighbors are land OR neighbor sum > 2
+        # Water if 3+ neighbors are water OR neighbor sum < 2
+        new_noise = np.where(
+            (neighbor_sum > 2.0) | ((neighbor_sum >= 2.0) & (noise == 1.0)),
+            1.0,
+            0.0
+        )
+
+        noise = new_noise
+
+    # Convert back to int and update world
+    world.noise_array = noise.astype(np.int8)
+    update_tiles_from_array(world.noise_array)
+
+def build_tile_lookup() -> None:
+    """
+    Builds a flat dictionary for O(1) tile lookups.
+    """
+    world.tiles_by_position.clear()
+    for chunk in world.chunks.values():
+        world.tiles_by_position.update(chunk.tiles)
+
+def render_world(screen: pygame.Surface) -> None:
+    """
+    Renders the world by building a tile-level color array and scaling it up efficiently.
+    This avoids per-pixel loops and makes rendering near-instant.
+    """
+    tiles_per_side = world_size_px // tile_size
+
+    # Pre-fill tile_type and color (do in one loop for CPU cache friendliness)
+    for tile in world.tiles_by_position.values():
+        i = tile.y // tile_size
+        j = tile.x // tile_size
+        tile.tile_type = get_tile_type(tile)
+        if tile.tile_type[0] in range(3) and random.random() > 0.3 and tile.noise_val != 0 and tile.tile_type[1] == 'f':
+            tile.tile_type = (1, 't')
+        tile.color = tile.get_tile_colour()
+
+    # Build tile-level color grid
+    color_grid = np.zeros((tiles_per_side, tiles_per_side, 3), dtype=np.uint8)
+    for tile in world.tiles_by_position.values():
+        i = tile.y // tile_size
+        j = tile.x // tile_size
+        color_grid[i, j] = tile.color
+
+    # Resize grid to pixel size using np.repeat (vectorized upscaling)
+    if tile_size > 1:
+        color_grid = np.repeat(np.repeat(color_grid, tile_size, axis=0), tile_size, axis=1)
+
+    pygame.surfarray.blit_array(screen, np.transpose(color_grid, (1, 0, 2)))
+    pygame.display.update()
 
 def get_tile_type(tile : Tile) -> tuple:
     """
@@ -252,46 +300,34 @@ def get_tile_type(tile : Tile) -> tuple:
             or a count of further neighbors if applicable).
         - A string indicating the type ('d' for direct, 'f' for further).
     """
+    neighbors = [(0, -tile_size), (-tile_size, 0), (0, tile_size), (tile_size, 0)]
     
-    direct_neighbor_ammount = compare_tile_neighbors(tile)[0]
-    further_neighbor_ammount = compare_tile_neighbors(tile, 2)[0]
-
-    if further_neighbor_ammount == 4 and tile.noise_val == 1 and random.random() >= 0.5:
-        further_neighbor_ammount -= 1
+    direct_neighbor_count = 0
+    further_neighbor_count = 0
     
-    if direct_neighbor_ammount < 4:
+    # Direct neighbors
+    for dx, dy in neighbors:
+        neighbor = world.tiles_by_position.get((tile.x + dx, tile.y + dy))
+        if neighbor and neighbor.noise_val == tile.noise_val:
+            direct_neighbor_count += 1
+        elif not neighbor:  # World boundary
+            direct_neighbor_count += 1 if tile.noise_val == 0 else 0
+    
+    # Further neighbors (distance 2)
+    for dx, dy in neighbors:
+        neighbor = world.tiles_by_position.get((tile.x + dx * 2, tile.y + dy * 2))
+        if neighbor and neighbor.noise_val == tile.noise_val:
+            further_neighbor_count += 1
+        elif not neighbor:  # World boundary
+            further_neighbor_count += 1 if tile.noise_val == 0 else 0
+    
+    if further_neighbor_count == 4 and tile.noise_val == 1 and random.random() >= 0.5:
+        further_neighbor_count -= 1
+    
+    if direct_neighbor_count < 4:
         return (1, 'd')
     else:
-        return (further_neighbor_ammount, 'f')
-
-def chunk_smoothen_noise(current_chunk : Chunk, repetition : int) -> None:
-    """
-    Smoothens the noise values of tiles in the current chunk by averaging with their neighbors.
-
-    This function iterates over all tiles in the specified chunk and updates each tile's noise value based on 
-    the noise values of its neighboring tiles, repeating the process for a given number of iterations.
-
-    Args:
-        current_chunk (Chunk): The chunk containing the tiles to be smoothed. Must have 'x', 'y', and 'tiles' attributes.
-        repetition (int): The number of times to repeat the smoothing process.
-    """
-    
-    current_chunk_x, current_chunk_y = current_chunk.x, current_chunk.y
-
-    for _ in range(repetition):
-        for y in range(current_chunk_y, current_chunk_y + chunk_size, tile_size):
-            for x in range(current_chunk_x, current_chunk_x + chunk_size, tile_size):
-                # Count how many neighbors are land (noise value of 1)
-                neighbor_ammount, combined_noise_value, average_noise_value = compare_tile_neighbors(current_chunk.tiles.get((x, y)), 1)
-
-                # Update the tile's noise value based on neighbors noise values
-                if current_chunk.tiles.get((x, y)):
-                    if (neighbor_ammount > 2 and average_noise_value == 1) or combined_noise_value > 2:
-                        current_chunk.tiles[(x, y)].noise_val = 1
-                    elif (neighbor_ammount > 2 and average_noise_value == 0) or combined_noise_value < 2:
-                        current_chunk.tiles[(x, y)].noise_val = 0
-                else:
-                    print("Failed to update tile")
+        return (further_neighbor_count, 'f')
 
 def generate_continent_map(continent_resolution : int, continent_ammount=3, gen_chance :float=1) -> None:
     '''
@@ -365,6 +401,8 @@ def generate_world(screen : pygame.Surface, world_seed : int) -> None:
         world_seed (int): The seed used for random number generation to ensure consistent world generation.
     """
     
+    start_time = time.time() # Start timing for whole function
+
     random.seed(world_seed) # Seed is initialized here to keep consistency in the generated noise
     chunk_ID = 0 # Initializes the chunk ID value
 
@@ -372,14 +410,20 @@ def generate_world(screen : pygame.Surface, world_seed : int) -> None:
     # 0 = raw noise, 1 = coarse noise, 2+ = smoother noise, etc
     # The higher the number the less smoothing it can apply to the noise 
     # and higher performance costs
-    noise_smoothing_repetition = 3 
+    noise_smoothing_repetition = 4 
     continent_resolution = 8 # how much to divide chunks for continent details
+
+    continent_time_start = time.time()
 
     # Fills the continent map with placeholder tiles
     world.continent_map = {(y, x) : Tile(x, y, 0, 0) 
                             for y in range(0, world_size_px, int(chunk_size/continent_resolution)) 
                             for x in range(0, world_size_px, int(chunk_size/continent_resolution))} 
     generate_continent_map(continent_resolution, 5)
+
+    print(f"Continent generation: {time.time() - continent_time_start:.6f} seconds")
+
+    chunk_time_start = time.time()
 
     # Fills the chunks with tiles, 
     # this is raw noise at this point 
@@ -403,13 +447,20 @@ def generate_world(screen : pygame.Surface, world_seed : int) -> None:
             chunk = Chunk(chunk_x, chunk_y, chunk_ID, chunk_tiles)
             world.chunks[(chunk_x, chunk_y)] = chunk
             chunk_ID += 1
+    print(f"Chunk creation: {time.time() - chunk_time_start:.6f} seconds")
 
-    # Smoothen the noise in every chunk
-    for (x, y), chunk in world.chunks.items():
-        chunk_smoothen_noise(chunk, noise_smoothing_repetition)
-        chunk.load_chunk(screen)
+    build_tile_lookup()
+
+    smoothing_time_start = time.time()
+    smoothen_noise_vectorized(noise_smoothing_repetition)
+    print(f"Smoothing: {time.time() - smoothing_time_start:.6f} seconds")
+
+    render_time_start = time.time()
+    render_world(screen)
+    print(f"Rendering: {time.time() - render_time_start:.6f} seconds")
 
     pygame.image.save(screen, 'world.png') # Saves an image of the world to see the details and help with debugging
+    print(f"Full world generation: {time.time() - start_time:.6f} seconds")
 
 def main() -> None:
     """
