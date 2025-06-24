@@ -2,7 +2,7 @@
 
 This project implements a noise-based world generation system using Python and Pygame. It generates chunks of land with customizable noise, continents, and tile types, rendering them as graphical representations on a screen. The noise is generated using Python's random function without relying on external noise libraries.
 
-This project was primarily created as a personal challenge to practice Python and experiment with procedural generation. Note that some artifacts may appear at chunk edges, which is a known issue.
+This project was primarily created as a personal challenge to practice Python and experiment with procedural generation.
 
 ## Features
 
