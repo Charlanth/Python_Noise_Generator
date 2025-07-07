@@ -14,7 +14,7 @@ This project was primarily created as a personal challenge to practice Python an
 
 1. Clone the repository:
     ```bash
-    git clone https://github.com/your-username/Noise_Generator.git
+    git clone https://github.com/Charlanth/Noise_Generator.git
     ```
 2. Navigate to the project directory:
     ```bash
